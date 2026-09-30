@@ -1,0 +1,23 @@
+[Unit]
+Description=NexSecurity Telegram stream relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tgstream
+WorkingDirectory=/opt/tg-stream
+EnvironmentFile=/opt/tg-stream/.env
+ExecStart=/opt/tg-stream/venv/bin/python3 server.py
+Restart=on-failure
+RestartSec=5
+# Defense-in-depth: this process only needs to open outbound TG
+# connections and listen on 127.0.0.1 — no reason it should ever write
+# outside its own directory.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/tg-stream
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

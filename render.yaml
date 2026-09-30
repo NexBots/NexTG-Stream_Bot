@@ -1,0 +1,36 @@
+# Render "Blueprint" — lets Render read this file and pre-fill most of
+# the service config for you. Still requires manually pasting the
+# secret values in the dashboard (Render never lets a blueprint carry
+# real secrets in the repo). See tg-stream/README.md for what each one
+# is and how to get it.
+services:
+  - type: web
+    name: tg-stream
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: free
+    healthCheckPath: /healthz
+    envVars:
+      - key: LISTEN_HOST
+        value: 0.0.0.0
+      - key: TRUSTED_PROXY_HOPS
+        value: "1"
+      - key: SESSION_TTL_SECONDS
+        value: "28800"
+      - key: CHUNK_CACHE_MAX_MB
+        value: "256"
+      - key: RATE_LIMIT_PER_MIN
+        value: "240"
+      - key: TELEGRAM_API_ID
+        sync: false
+      - key: TELEGRAM_API_HASH
+        sync: false
+      - key: TELEGRAM_SESSION_STRING
+        sync: false
+      - key: TELEGRAM_STREAM_TOKEN_SECRET
+        sync: false
+      - key: APP_ORIGIN
+        sync: false
+      - key: SECURITY_WEBHOOK_SECRET
+        sync: false

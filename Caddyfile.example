@@ -1,0 +1,10 @@
+tg.example.com {
+	# Caddy gets you free auto-TLS with zero config beyond the domain
+	# name above. Replace tg.example.com with your real subdomain and
+	# point its DNS A/AAAA record at this server before starting Caddy.
+	reverse_proxy 127.0.0.1:8088 {
+		# Long-lived streaming responses (a 2-5h class) — make sure
+		# Caddy doesn't time out or buffer the whole response.
+		flush_interval -1
+	}
+}
