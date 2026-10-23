@@ -104,14 +104,50 @@ async def report_suspicious(reason: str, aid: str, vid: str, uid: str, ip: str):
 
     try:
         async with aiohttp.ClientSession() as s:
-            await s.post(
+            # `async with` on the response + reading the body is what
+            # releases the connection; without it aiohttp logs
+            # "Unclosed connection" for every report.
+            async with s.post(
                 f"{APP_ORIGIN.rstrip('/')}/api/security/token-mismatch",
                 json={"reason": reason, "aid": aid, "videoId": vid, "uid": uid, "ip": ip},
                 headers={"X-Security-Webhook-Secret": SECURITY_WEBHOOK_SECRET},
                 timeout=aiohttp.ClientTimeout(total=5),
-            )
+            ) as r:
+                await r.read()
     except Exception as e:  # fire-and-forget — never let this break playback
         log.warning("suspicious-activity report failed: %s", e)
+
+
+class SourceUnavailable(LookupError):
+    """The Telegram source can't be played. `reason` is for OUR logs only
+    (never sent to the browser); `status` is the HTTP status we answer with."""
+
+    def __init__(self, reason: str, status: int = 404):
+        super().__init__(reason)
+        self.reason = reason
+        self.status = status
+
+
+async def _nearby_summary(entity, msg_id: int) -> str:
+    """Best-effort: what are the messages around `msg_id`? When an admin
+    pastes the wrong link this shows exactly which neighbouring id holds
+    the video, so the fix is obvious from the log alone."""
+    try:
+        ids = [i for i in range(msg_id - 3, msg_id + 4) if i > 0 and i != msg_id]
+        msgs = await client.get_messages(entity, ids=ids)
+        parts = []
+        for i, m in zip(ids, msgs):
+            if m is None:
+                parts.append(f"{i}=missing")
+            elif m.document:
+                parts.append(f"{i}=VIDEO/FILE")
+            elif m.media:
+                parts.append(f"{i}=other-media")
+            else:
+                parts.append(f"{i}=text")
+        return ", ".join(parts)
+    except Exception as e:  # diagnostics must never break playback
+        return f"(could not inspect nearby messages: {type(e).__name__})"
 
 
 async def resolve_message(sr: core.SourceRef):
@@ -120,17 +156,49 @@ async def resolve_message(sr: core.SourceRef):
     if cached and time.time() - cached[1] < _MSG_CACHE_TTL:
         return cached[0]
 
-    if sr.kind == "private":
-        # Numeric internal channel id -> Telethon peer. The account this
-        # client is logged in as MUST already be a member of the channel
-        # (see README.md) or get_entity will fail.
-        entity = await client.get_entity(int(f"-100{sr.peer}"))
-    else:
-        entity = await client.get_entity(sr.peer)
+    try:
+        if sr.kind == "private":
+            # Numeric internal channel id -> Telethon peer. The account this
+            # client is logged in as MUST already be a member of the channel
+            # (see README.md) or get_entity will fail.
+            entity = await client.get_entity(int(f"-100{sr.peer}"))
+        else:
+            entity = await client.get_entity(sr.peer)
+    except errors.FloodWaitError:
+        raise
+    except (ValueError, errors.RPCError) as e:
+        raise SourceUnavailable(
+            f"the Telegram account can't open this chat ({type(e).__name__}: {e}). "
+            "Check the channel id in the link, and that the bot is added to the channel as an admin.",
+            403,
+        )
 
-    msg = await client.get_messages(entity, ids=sr.msg_id)
-    if msg is None or msg.media is None:
-        raise LookupError("message not found or has no media")
+    try:
+        msg = await client.get_messages(entity, ids=sr.msg_id)
+    except errors.FloodWaitError:
+        raise
+    except errors.RPCError as e:
+        raise SourceUnavailable(f"Telegram refused to return message {sr.msg_id} ({type(e).__name__}: {e}).", 403)
+
+    title = getattr(entity, "title", None) or getattr(entity, "username", None) or sr.peer
+    if msg is None:
+        raise SourceUnavailable(
+            f"message id {sr.msg_id} does not exist in chat {title!r} (deleted, or wrong id in the link). "
+            f"Neighbouring messages: {await _nearby_summary(entity, sr.msg_id)}",
+            404,
+        )
+    if msg.media is None:
+        raise SourceUnavailable(
+            f"message id {sr.msg_id} in chat {title!r} is a text-only message, not a video. "
+            f"Neighbouring messages: {await _nearby_summary(entity, sr.msg_id)}",
+            404,
+        )
+    if not msg.document:
+        raise SourceUnavailable(
+            f"message id {sr.msg_id} in chat {title!r} has media ({type(msg.media).__name__}) but no video file. "
+            f"Neighbouring messages: {await _nearby_summary(entity, sr.msg_id)}",
+            404,
+        )
     _msg_cache[key] = (msg, time.time())
     return msg
 
@@ -262,9 +330,12 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
     try:
         msg = await resolve_message(parsed_ref)
         size = document_size(msg)
+    except SourceUnavailable as e:
+        log.error("[error] can't play source_ref=%r (video_id=%s): %s", source_ref, video_id, e.reason)
+        return json_error("Playback unavailable.", e.status)
     except LookupError as e:
         log.error("[error] couldn't resolve Telegram message for source_ref=%r: %s", source_ref, e)
-        return json_error("Playback unavailable.", 500)
+        return json_error("Playback unavailable.", 404)
     except errors.FloodWaitError as e:
         log.warning("Telegram flood-wait %ss while resolving %s", e.seconds, source_ref)
         return json_error("Server is busy, try again shortly.", 503)
