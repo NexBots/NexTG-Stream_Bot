@@ -155,3 +155,9 @@ parses either link shape itself (`app/admin/videos/page.tsx`'s
   attached to a board and gated by `canAccessBoard` exactly like every
   other class.
 "# NexTG-Stream_Bot" 
+
+## Start-up speed (time until the first frame)
+
+- `KEEP_ALIVE` (default on): on Render the service pings its own `/healthz` every 10 min so the free plan never sleeps (a cold start is 30-60 s). Set `KEEP_ALIVE=0` to disable.
+- Security reports to the website no longer delay the first byte (they run in the background). `REPORT_IP_MISMATCH=0` turns the Vercel-vs-Render IP-difference report off entirely.
+- Best results: Render region closest to the viewers (Singapore for Bangladesh), and videos saved with the moov atom at the front: `ffmpeg -i in.mp4 -c copy -movflags +faststart out.mp4` before posting to Telegram.

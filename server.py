@@ -66,6 +66,14 @@ APP_ORIGIN = os.environ.get("APP_ORIGIN", "")  # e.g. https://learn.nexsecurity.
 SECURITY_WEBHOOK_SECRET = os.environ.get("SECURITY_WEBHOOK_SECRET", "")  # same var name/value as worker/wrangler.toml
 TRUSTED_PROXY_HOPS = int(os.environ.get("TRUSTED_PROXY_HOPS", "1"))  # 1 = Caddy/nginx directly in front
 
+# Render's free plan puts a service to sleep after ~15 min without inbound
+# traffic, and the next request then waits 30-60s for a cold start. Pinging
+# our own public URL every 10 min keeps it awake. Render sets
+# RENDER_EXTERNAL_URL itself; set KEEP_ALIVE=0 to turn this off.
+KEEP_ALIVE = os.environ.get("KEEP_ALIVE", "1") != "0"
+SELF_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
+REPORT_IP_MISMATCH = os.environ.get("REPORT_IP_MISMATCH", "1") != "0"
+
 SESSION_TTL_SECONDS = int(os.environ.get("SESSION_TTL_SECONDS", str(8 * 3600)))  # comfortably over the longest class
 CHUNK_CACHE_BYTES = int(os.environ.get("CHUNK_CACHE_MAX_MB", "256")) * 1024 * 1024
 DOWNLOAD_CHUNK = 1024 * 1024  # Telegram MTProto part size for iter_download; must stay a power of 2, 4KiB-aligned
@@ -95,6 +103,31 @@ def rate_limited(key: str, limit: int = RATE_LIMIT_PER_MIN, window: float = 60.0
     count += 1
     _rate_buckets[key] = (count, reset_at)
     return count > limit
+
+
+_bg_tasks: set = set()
+
+
+def fire_and_forget(coro) -> None:
+    """Runs `coro` in the background so the viewer's first byte never waits
+    on it (keeps a strong ref so the task isn't garbage-collected early)."""
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+
+async def keep_alive_loop():
+    import aiohttp
+
+    url = f"{SELF_URL.rstrip('/')}/healthz"
+    while True:
+        await asyncio.sleep(600)
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    await r.read()
+        except Exception as e:
+            log.warning("keep-alive ping failed: %s", e)
 
 
 async def report_suspicious(reason: str, aid: str, vid: str, uid: str, ip: str):
@@ -287,7 +320,8 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
                 "(raw ip seen here=%s) — allowed anyway, see the comment above this line. video_id=%s",
                 payload.get("ip"), ip_hash, ip, video_id,
             )
-            await report_suspicious("ip_mismatch", payload.get("aid", ""), video_id, payload.get("uid", ""), ip)
+            if REPORT_IP_MISMATCH:
+                fire_and_forget(report_suspicious("ip_mismatch", payload.get("aid", ""), video_id, payload.get("uid", ""), ip))
         source_ref = payload.get("sr", "")
         uid = payload.get("uid", "")
         aid = payload.get("aid", "")
@@ -315,7 +349,7 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
     ua = request.headers.get("User-Agent", "")
     if SUSPICIOUS_UA_RE.search(ua):
         log.warning("[deny] suspicious User-Agent %r, video_id=%s ip=%s", ua, video_id, ip)
-        await report_suspicious("bot_signature", getattr(sess, "aid", ""), video_id, uid, ip)
+        fire_and_forget(report_suspicious("bot_signature", getattr(sess, "aid", ""), video_id, uid, ip))
         return json_error("Access denied.", 403)
 
     if rate_limited(uid):
@@ -479,10 +513,15 @@ async def on_startup(app: web.Application):
     me = await client.get_me()
     log.info("Telegram client connected as %s", getattr(me, "username", None) or me.id)
     app["purge_task"] = asyncio.create_task(periodic_purge())
+    if KEEP_ALIVE and SELF_URL:
+        app["keepalive_task"] = asyncio.create_task(keep_alive_loop())
+        log.info("keep-alive enabled: pinging %s/healthz every 10 min", SELF_URL.rstrip("/"))
 
 
 async def on_cleanup(app: web.Application):
     app["purge_task"].cancel()
+    if "keepalive_task" in app:
+        app["keepalive_task"].cancel()
     await client.disconnect()
 
 
