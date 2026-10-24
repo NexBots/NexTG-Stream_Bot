@@ -169,3 +169,10 @@ Set `SCAN_KEY` (any long random string) in Render, redeploy, then open:
 `https://<your-bot>.onrender.com/scan?chat=c/4407121895&from=1&to=200&key=<SCAN_KEY>`
 
 It lists every message id in that range that holds a video/file (name, size, duration, ready-made link). Use `from`/`to` to page (max 300 ids per call). **Delete `SCAN_KEY` afterwards** — the endpoint then disappears (404).
+
+## Playback speed
+
+- Chunks are now fetched from Telegram **in parallel** (`PREFETCH_CHUNKS`, default 4; `STARTUP_CHUNKS`, default 2, applies until the first bytes are sent). Before, one 1MB request was in flight at a time.
+- Every request logs `[perf] ... first_byte=…s (resolve …s, telegram …s)` so you can see where time goes: `resolve` = finding the message, `telegram` = getting the first chunk.
+- `Dockerfile` installs `cryptg` (fast AES) when a wheel is available. The startup log says whether it is active.
+- Biggest remaining factors (outside the code): Render region close to viewers (Singapore for Bangladesh), and MP4s with the index at the front: `ffmpeg -i in.mp4 -c copy -movflags +faststart out.mp4`.

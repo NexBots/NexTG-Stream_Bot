@@ -4,6 +4,9 @@ WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+# cryptg makes Telegram's AES several times faster. Optional: if no prebuilt
+# wheel exists for this platform, the build must still succeed without it.
+RUN pip install --no-cache-dir cryptg || echo "cryptg not installed, continuing without it"
 
 COPY core.py server.py ./
 

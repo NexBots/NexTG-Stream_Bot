@@ -38,6 +38,7 @@ import logging
 import os
 import re
 import time
+from collections import deque
 from typing import Optional
 
 from aiohttp import web
@@ -269,6 +270,7 @@ async def handle_options(request: web.Request) -> web.Response:
 
 
 async def handle_stream(request: web.Request) -> web.StreamResponse:
+    t0 = time.monotonic()
     video_id = request.match_info["video_id"]
     token = request.query.get("t")
     ip = core.client_ip(request.headers.get("X-Forwarded-For"), request.remote, TRUSTED_PROXY_HOPS)
@@ -366,6 +368,7 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
     try:
         msg = await resolve_message(parsed_ref)
         size = document_size(msg)
+        t_resolved = time.monotonic()
     except SourceUnavailable as e:
         log.error("[error] can't play source_ref=%r (video_id=%s): %s", source_ref, video_id, e.reason)
         return json_error("Playback unavailable.", e.status)
@@ -398,7 +401,7 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
 
     sess.conns += 1
     try:
-        await stream_range(msg, start, end, resp)
+        await stream_range(msg, start, end, resp, perf=(t0, t_resolved, video_id))
     except (ConnectionResetError, asyncio.CancelledError):
         pass  # viewer paused/seeked/closed the tab — not an error
     except errors.FileReferenceExpiredError:
@@ -410,92 +413,100 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
     return resp
 
 
-# How many chunks to keep downloaded-but-not-yet-sent-to-the-browser at
-# once. This is the actual fix for the stutter: without it, each loop
-# iteration does "await download, THEN await send" strictly back to
-# back, so every network hiccup on the Telegram side shows up directly
-# as a stall in the browser. With a small read-ahead buffer, the
-# downloader keeps pulling the NEXT chunk from Telegram while the
-# CURRENT one is still being flushed to the browser's socket, so a
-# brief slowdown on one side gets absorbed instead of becoming a visible
-# stutter. Each chunk is DOWNLOAD_CHUNK bytes (1MB), so 4 is a ~4MB
-# read-ahead window — enough to smooth normal jitter without holding a
-# large amount of memory per concurrent viewer (this multiplies by
-# however many Range connections are open at once).
+# How many 1MB chunks are being fetched from Telegram AT THE SAME TIME.
+# The old code pulled them strictly one after another (one request in
+# flight), so download speed was capped at roughly 1MB / Telegram-round-trip
+# (a few MB/s) no matter how fast the connection was, and the first seconds
+# of a video felt slow. Fetching several chunks concurrently over the same
+# MTProto connection hides that round-trip time, so playback starts sooner
+# and keeps its buffer full. Memory per viewer is about this many MB.
 PREFETCH_CHUNKS = int(os.environ.get("PREFETCH_CHUNKS", "4"))
+# Until the first bytes have reached the browser only this many chunks are
+# fetched together, so the first chunk isn't slowed down by its siblings.
+STARTUP_CHUNKS = int(os.environ.get("STARTUP_CHUNKS", "2"))
 
 
-async def stream_range(msg, start: int, end: int, resp: web.StreamResponse):
+async def fetch_chunk(msg, offset: int) -> bytes:
+    """One DOWNLOAD_CHUNK-sized part of the file starting at `offset`
+    (must be DOWNLOAD_CHUNK-aligned). Served from the chunk cache when
+    possible; b'' means the offset is past the end of the file."""
+    key = (msg.chat_id, msg.id, offset)
+    cached = chunk_cache.get(key)
+    if cached is not None:
+        return cached
+    it = client.iter_download(msg.media, offset=offset, request_size=DOWNLOAD_CHUNK, limit=1)
+    data = b""
+    try:
+        async for part in it:
+            data = bytes(part)
+            break
+    finally:
+        closer = getattr(it, "close", None)
+        if closer is not None:
+            try:
+                await closer()
+            except Exception:
+                pass
+    if data:
+        chunk_cache.put(key, data)
+    return data
+
+
+async def stream_range(msg, start: int, end: int, resp: web.StreamResponse, perf: Optional[tuple] = None):
     """Downloads [start, end] (inclusive) from Telegram and writes it to
-    the HTTP response as it arrives. Telegram/MTProto downloads must
-    happen in 4096-byte-aligned chunks; we round `start` down to the
-    nearest DOWNLOAD_CHUNK boundary ourselves and trim the extra leading
-    bytes off the first yielded chunk, rather than relying on a specific
-    Telethon version's own offset-rounding behavior.
+    the HTTP response as it arrives. MTProto downloads happen in aligned
+    chunks, so `start` is rounded down to a DOWNLOAD_CHUNK boundary and the
+    extra leading bytes are trimmed off the first chunk.
 
-    Downloading and writing-to-the-browser run as two separate
-    concurrent tasks joined by a small bounded queue (see
-    PREFETCH_CHUNKS above), instead of one strictly alternating loop —
-    that overlap is what actually smooths out playback stutter; it is
-    not just a buffering cosmetic.
+    Up to PREFETCH_CHUNKS chunks are fetched concurrently and written in
+    order (see the comment above). `perf` = (t0, t_resolved, video_id) is
+    only used to log how long the first byte took.
     """
     aligned_start = (start // DOWNLOAD_CHUNK) * DOWNLOAD_CHUNK
-    to_skip = start - aligned_start
-    remaining_total = end - start + 1
+    skip = start - aligned_start
+    remaining = end - start + 1
+    last_offset = (end // DOWNLOAD_CHUNK) * DOWNLOAD_CHUNK
+    offsets = iter(range(aligned_start, last_offset + 1, DOWNLOAD_CHUNK))
 
-    # Serve straight from cache with no network round trip at all when
-    # every needed chunk is already there (a rewind, or a second student
-    # a few seconds behind the first).
-    cache_key0 = (msg.chat_id, msg.id, aligned_start)
-    cached0 = chunk_cache.get(cache_key0)
-    if cached0 is not None:
-        piece = cached0[to_skip:]
-        write_len = min(len(piece), remaining_total)
-        await resp.write(piece[:write_len])
-        remaining_total -= write_len
-        if remaining_total <= 0:
-            return
-        aligned_start += DOWNLOAD_CHUNK
-        to_skip = 0
+    pending: deque = deque()
+    window = max(1, min(STARTUP_CHUNKS, PREFETCH_CHUNKS))
+    wrote_first = False
 
-    queue: asyncio.Queue = asyncio.Queue(maxsize=PREFETCH_CHUNKS)
-    SENTINEL = object()
+    def schedule():
+        while len(pending) < window:
+            off = next(offsets, None)
+            if off is None:
+                return
+            pending.append(asyncio.create_task(fetch_chunk(msg, off)))
 
-    async def downloader():
-        try:
-            async for chunk in client.iter_download(msg.media, offset=aligned_start, request_size=DOWNLOAD_CHUNK):
-                await queue.put(bytes(chunk))
-        except Exception as e:  # surfaced to the writer loop below via the queue
-            await queue.put(e)
-        finally:
-            await queue.put(SENTINEL)
-
-    dl_task = asyncio.create_task(downloader())
     try:
-        offset = aligned_start
-        remaining = remaining_total
-        skip = to_skip
-        while remaining > 0:
-            item = await queue.get()
-            if item is SENTINEL:
+        schedule()
+        while pending and remaining > 0:
+            data = await pending.popleft()
+            if not data:
                 break
-            if isinstance(item, Exception):
-                raise item
-            chunk_bytes: bytes = item
-            chunk_cache.put((msg.chat_id, msg.id, offset), chunk_bytes)
-            piece = chunk_bytes[skip:] if skip else chunk_bytes
+            piece = data[skip:] if skip else data
             skip = 0
-            write_len = min(len(piece), remaining)
-            if write_len > 0:
-                await resp.write(piece[:write_len])
-                remaining -= write_len
-            offset += len(chunk_bytes)
+            n = min(len(piece), remaining)
+            if n > 0:
+                await resp.write(piece if n == len(piece) else piece[:n])
+                remaining -= n
+                if not wrote_first:
+                    wrote_first = True
+                    window = max(1, PREFETCH_CHUNKS)  # now fill the whole read-ahead window
+                    if perf:
+                        t0, t_res, vid = perf
+                        log.info(
+                            "[perf] video_id=%s range=%d-%d first_byte=%.2fs (resolve %.2fs, telegram %.2fs)",
+                            vid, start, end, time.monotonic() - t0, t_res - t0, time.monotonic() - t_res,
+                        )
+            schedule()
     finally:
-        dl_task.cancel()
-        try:
-            await dl_task
-        except (asyncio.CancelledError, Exception):
-            pass
+        tasks = list(pending)
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def handle_health(request: web.Request) -> web.Response:
@@ -602,6 +613,12 @@ async def on_startup(app: web.Application):
     await client.start()
     me = await client.get_me()
     log.info("Telegram client connected as %s", getattr(me, "username", None) or me.id)
+    try:
+        import cryptg  # noqa: F401
+
+        log.info("cryptg is installed: fast AES for Telegram downloads")
+    except ImportError:
+        log.warning("cryptg is NOT installed: Telegram downloads use slower AES (see README, speed section)")
     app["purge_task"] = asyncio.create_task(periodic_purge())
     if KEEP_ALIVE and SELF_URL:
         app["keepalive_task"] = asyncio.create_task(keep_alive_loop())
