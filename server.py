@@ -32,6 +32,8 @@ TELEGRAM_SESSION_STRING).
 from __future__ import annotations
 
 import asyncio
+import hmac
+import json
 import logging
 import os
 import re
@@ -508,6 +510,94 @@ async def periodic_purge():
             log.info("purged %d expired sessions", n)
 
 
+
+# --------------------------------------------------------------------------
+# /scan: admin-only helper that lists which message ids in a channel really
+# hold a video/file, so the right link can be copied without guessing.
+# Disabled unless the SCAN_KEY env var is set. Remove SCAN_KEY when done.
+# --------------------------------------------------------------------------
+
+SCAN_KEY = os.environ.get("SCAN_KEY", "")
+SCAN_MAX_IDS = 300
+
+
+def _media_kind(m) -> str:
+    if m.video:
+        return "video"
+    if m.document:
+        return "file"
+    if m.photo:
+        return "photo"
+    return "other-media"
+
+
+async def handle_scan(request: web.Request) -> web.Response:
+    # Looks like a missing route when disabled, so it can't be probed.
+    if not SCAN_KEY:
+        return web.Response(status=404, text="Not Found")
+    given = request.query.get("key", "")
+    if not hmac.compare_digest(given.encode(), SCAN_KEY.encode()):
+        return web.Response(status=404, text="Not Found")
+
+    chat = request.query.get("chat", "").strip().strip("/")
+    # chat = "c/4407121895" (private channel) or "username" (public)
+    sr = core.parse_source_ref(f"{chat}/1")
+    if not sr:
+        return web.json_response({"error": "chat must look like c/4407121895 or a public username"}, status=400)
+    try:
+        start = max(1, int(request.query.get("from", "1")))
+        end = int(request.query.get("to", str(start + 199)))
+    except ValueError:
+        return web.json_response({"error": "from/to must be numbers"}, status=400)
+    end = min(end, start + SCAN_MAX_IDS - 1)
+    if end < start:
+        return web.json_response({"error": "to must be >= from"}, status=400)
+
+    try:
+        entity = await client.get_entity(int(f"-100{sr.peer}") if sr.kind == "private" else sr.peer)
+    except (ValueError, errors.RPCError) as e:
+        return web.json_response({"error": f"bot can't open this chat: {type(e).__name__}: {e}"}, status=403)
+
+    ids = list(range(start, end + 1))
+    found, counts = [], {"missing": 0, "text_or_service": 0}
+    for i in range(0, len(ids), 100):
+        batch = ids[i : i + 100]
+        try:
+            msgs = await client.get_messages(entity, ids=batch)
+        except errors.RPCError as e:
+            return web.json_response({"error": f"Telegram refused: {type(e).__name__}: {e}"}, status=502)
+        for mid, m in zip(batch, msgs):
+            if m is None:
+                counts["missing"] += 1
+            elif not m.media:
+                counts["text_or_service"] += 1
+            else:
+                doc = m.document
+                attrs = {type(a).__name__: a for a in (doc.attributes if doc else [])}
+                duration = getattr(attrs.get("DocumentAttributeVideo"), "duration", None)
+                fname = getattr(attrs.get("DocumentAttributeFilename"), "file_name", None)
+                found.append(
+                    {
+                        "id": mid,
+                        "type": _media_kind(m),
+                        "name": fname,
+                        "size_mb": round(doc.size / 1048576, 1) if doc else None,
+                        "duration_s": int(duration) if duration else None,
+                        "caption": (m.message or "")[:60] or None,
+                        "link": f"https://t.me/c/{sr.peer}/{mid}" if sr.kind == "private" else f"https://t.me/{sr.peer}/{mid}",
+                    }
+                )
+
+    body = {
+        "chat": getattr(entity, "title", None) or str(sr.peer),
+        "scanned": f"{start}-{end}",
+        "counts": {**counts, "with_media": len(found)},
+        "media_messages": found,
+        "next": f"scan?chat={chat}&from={end + 1}&key=...",
+    }
+    return web.Response(text=json.dumps(body, indent=2, ensure_ascii=False), content_type="application/json")
+
+
 async def on_startup(app: web.Application):
     await client.start()
     me = await client.get_me()
@@ -534,6 +624,7 @@ def build_app() -> web.Application:
     app.router.add_get("/tg/{video_id}", handle_stream)
     app.router.add_route("OPTIONS", "/tg/{video_id}", handle_options)
     app.router.add_get("/healthz", handle_health)
+    app.router.add_get("/scan", handle_scan)
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
     return app
