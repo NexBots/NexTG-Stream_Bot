@@ -176,3 +176,24 @@ It lists every message id in that range that holds a video/file (name, size, dur
 - Every request logs `[perf] ... first_byte=…s (resolve …s, telegram …s)` so you can see where time goes: `resolve` = finding the message, `telegram` = getting the first chunk.
 - `Dockerfile` installs `cryptg` (fast AES) when a wheel is available. The startup log says whether it is active.
 - Biggest remaining factors (outside the code): Render region close to viewers (Singapore for Bangladesh), and MP4s with the index at the front: `ffmpeg -i in.mp4 -c copy -movflags +faststart out.mp4`.
+
+## Anti-download hardening
+
+What a student's browser can see (the playback URL) can always be copied, so the goal is: a copied URL is useless anywhere else, ordinary download tools fail, bulk copying is slow and visible. Everything below can be tuned or switched off with env vars on Render.
+
+| Protection | Default | Env var |
+|---|---|---|
+| Request must come from a `<video>` element (`Sec-Fetch-Dest: video`), not curl/IDM/a pasted URL/`fetch()` | on | `REQUIRE_FETCH_DEST=0` turns off |
+| Page embedding the player must be your site (`Referer` = `APP_ORIGIN`) | on | `REQUIRE_REFERER=0`, extra sites: `EXTRA_ALLOWED_ORIGINS=a,b` |
+| One URL used from more than N different networks is killed and its token revoked | 4 | `MAX_SESSION_IP_CHANGES` |
+| Hard age limit of a playback session (player silently gets a new token) | 6 h | `SESSION_MAX_SECONDS` |
+| Max parallel connections per user+video (download managers open many) | 4 | `MAX_CONNS_PER_VIEWER` |
+| Speed limit per user+video = 3x the video's own bitrate, with a ~2 min burst for fast start and seeking (a bulk copy takes ~1/3 of the video's length) | on | `THROTTLE_DOWNLOADS=0`, `STREAM_RATE_FACTOR` |
+| Data cap per user+video per 24 h = 6x the file size | 6 | `DAILY_BYTES_FACTOR` (0 = no cap) |
+| More download-tool user agents blocked (IDM, ffmpeg, aria2, yt-dlp, ...) | on | — |
+| Client IP can't be faked via `X-Forwarded-For` (uses `CF-Connecting-IP` / `True-Client-IP`, else the proxy-appended entry) | on | `CLIENT_IP_HEADER` |
+| Playback tokens (`?t=`) are blanked out of the access log | on | — |
+
+After deploying, test playback on desktop Chrome, Android Chrome and iPhone Safari. If a browser can't play, set `REQUIRE_FETCH_DEST=0` and tell me which one.
+
+Also in Telegram: for the source channel turn on **Restrict saving content** (channel settings), keep it private, and don't add students to it.

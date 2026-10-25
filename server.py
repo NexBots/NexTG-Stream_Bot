@@ -86,7 +86,96 @@ sessions = core.SessionStore(ttl=SESSION_TTL_SECONDS)
 chunk_cache = core.ChunkCache(CHUNK_CACHE_BYTES)
 _rate_buckets: dict[str, tuple[int, float]] = {}
 
-SUSPICIOUS_UA_RE = re.compile(r"curl|wget|python-requests|okhttp|libwww|aria2|yt-dlp|^$", re.I)
+SUSPICIOUS_UA_RE = re.compile(
+    r"curl|wget|python-requests|python-urllib|aiohttp|httpx|okhttp|libwww|aria2|yt-dlp|youtube-dl|ffmpeg|lavf|"
+    r"internet download manager|\bidm\b|downloader|httrack|postman|insomnia|axios|node-fetch|go-http-client|java/|^$",
+    re.I,
+)
+
+# ---------------------------------------------------------------------------
+# Anti-download hardening (all can be tuned / switched off with env vars)
+# ---------------------------------------------------------------------------
+# Real <video> elements send "Sec-Fetch-Dest: video"; curl, IDM, wget, scripts,
+# opening the URL in a tab ("document") and fetch() ("empty") do not.
+REQUIRE_FETCH_DEST = os.environ.get("REQUIRE_FETCH_DEST", "1") != "0"
+# The page that embeds the player must be ours (browser sends it automatically).
+REQUIRE_REFERER = os.environ.get("REQUIRE_REFERER", "1") != "0"
+ALLOWED_ORIGINS = [o.strip().rstrip("/") for o in ([APP_ORIGIN] + os.environ.get("EXTRA_ALLOWED_ORIGINS", "").split(",")) if o.strip()]
+# A stolen/copied URL stops working once it's used from more than this many
+# different networks (a student switching Wi-Fi <-> mobile data uses 1-2).
+MAX_SESSION_IP_CHANGES = int(os.environ.get("MAX_SESSION_IP_CHANGES", "4"))
+# Hard cap on one playback session's age; the player silently gets a new token.
+SESSION_MAX_SECONDS = int(os.environ.get("SESSION_MAX_SECONDS", str(6 * 3600)))
+# Limits per (user, video), see core.ViewerLimiter.
+THROTTLE_DOWNLOADS = os.environ.get("THROTTLE_DOWNLOADS", "1") != "0"
+limiter = core.ViewerLimiter(
+    max_conns=int(os.environ.get("MAX_CONNS_PER_VIEWER", "4")),
+    day_factor=float(os.environ.get("DAILY_BYTES_FACTOR", "6")),  # 0 = no daily cap
+    rate_factor=float(os.environ.get("STREAM_RATE_FACTOR", "3")),
+)
+# Header the edge sets with the real client IP (Cloudflare: CF-Connecting-IP).
+# Empty = try CF-Connecting-IP, then True-Client-IP, then X-Forwarded-For.
+CLIENT_IP_HEADER = os.environ.get("CLIENT_IP_HEADER", "").strip()
+
+_ip_headers_logged = False
+
+# Tokens whose session we killed. Without this, a dropped session's token
+# (valid for ~90 s after it was minted) could simply be redeemed again.
+_revoked: dict = {}
+
+
+def revoke(jti: str) -> None:
+    sessions.drop(jti)
+    _revoked[jti] = time.time() + 900
+
+
+def request_ip(request: web.Request) -> str:
+    global _ip_headers_logged
+    h = request.headers
+    preferred = (h.get(CLIENT_IP_HEADER) if CLIENT_IP_HEADER else None) or h.get("CF-Connecting-IP") or h.get("True-Client-IP")
+    if not _ip_headers_logged:
+        _ip_headers_logged = True
+        log.info(
+            "[info] client-ip headers seen (first request): X-Forwarded-For=%r CF-Connecting-IP=%r True-Client-IP=%r remote=%r",
+            h.get("X-Forwarded-For"), h.get("CF-Connecting-IP"), h.get("True-Client-IP"), request.remote,
+        )
+    return core.client_ip(h.get("X-Forwarded-For"), request.remote, TRUSTED_PROXY_HOPS, preferred=preferred)
+
+
+def not_a_player_request(request: web.Request) -> Optional[str]:
+    """None if this looks like a <video> element on our own site; otherwise a
+    short reason (for the log). Not unforgeable by a determined person, but it
+    stops every ordinary download tool and 'open the URL / Save as' trick."""
+    h = request.headers
+    if REQUIRE_FETCH_DEST:
+        dest = h.get("Sec-Fetch-Dest", "").lower()
+        if dest not in ("video", "audio"):
+            return f"Sec-Fetch-Dest={dest or 'missing'}"
+    if REQUIRE_REFERER and ALLOWED_ORIGINS:
+        ref = (h.get("Referer") or h.get("Origin") or "").rstrip("/")
+        if not any(ref == o or ref.startswith(o + "/") for o in ALLOWED_ORIGINS):
+            return f"Referer={ref[:80] or 'missing'}"
+    return None
+
+
+class _RedactTokens(logging.Filter):
+    """aiohttp's access log prints the full URL, i.e. every playback token.
+    Anyone who can read the logs could replay them, so blank them out."""
+
+    _RE = re.compile(r'([?&]t=)[^\s&"]+')
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            if isinstance(record.msg, str):
+                record.msg = self._RE.sub(r"\1REDACTED", record.msg)
+            if record.args:
+                record.args = tuple(self._RE.sub(r"\1REDACTED", a) if isinstance(a, str) else a for a in record.args)
+        except Exception:
+            pass
+        return True
+
+
+logging.getLogger("aiohttp.access").addFilter(_RedactTokens())
 
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
@@ -273,14 +362,22 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
     t0 = time.monotonic()
     video_id = request.match_info["video_id"]
     token = request.query.get("t")
-    ip = core.client_ip(request.headers.get("X-Forwarded-For"), request.remote, TRUSTED_PROXY_HOPS)
+    ip = request_ip(request)
     ip_hash = core.hash_for_token(ip)
 
     if not token:
         log.warning("[deny] no token, video_id=%s ip=%s", video_id, ip)
         return json_error("Access denied.", 403)
 
+    why = not_a_player_request(request)
+    if why:
+        log.warning("[deny] not a player request (%s), video_id=%s ip=%s ua=%r", why, video_id, ip, request.headers.get("User-Agent", "")[:80])
+        return json_error("Access denied.", 403)
+
     jti = core.hash_for_token(token)
+    if _revoked.get(jti, 0) > time.time():
+        log.warning("[deny] revoked token presented again, video_id=%s ip=%s", video_id, ip)
+        return json_error("Access denied.", 403)
     sess = sessions.get(jti)
 
     if sess is None:
@@ -334,19 +431,25 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
         sess.uid = uid  # type: ignore[attr-defined]
         sess.aid = aid  # type: ignore[attr-defined]
     else:
-        # Established session — re-verify IP on every single request
-        # (this is what stops a copied URL from working off-network,
-        # same guarantee the Cloudflare Worker gives 'm3u8'), and slide
-        # the session's expiry forward.
-        if sess.ip != ip_hash:
-            # Same reasoning as the mint-time check above — logged, not
-            # blocked. Re-bind the session to whichever IP shows up most
-            # recently rather than leaving it pinned to the first one.
-            log.info(
-                "[info] established session's ip_hash changed: was %s, now %s (raw ip=%s) — allowed. video_id=%s",
-                sess.ip, ip_hash, ip, video_id,
+        # Established session. Two hard limits so a copied URL can't be used
+        # for long, or from somewhere else:
+        #  - absolute age (never slides), the player just fetches a new token;
+        #  - the client IP may change only a few times (Wi-Fi <-> mobile data
+        #    does that legitimately; two people using one URL flips it back
+        #    and forth constantly and trips the limit within seconds).
+        if time.time() - sess.born > SESSION_MAX_SECONDS:
+            revoke(jti)
+            log.info("[info] session older than %ss, dropped (player will get a new token). video_id=%s", SESSION_MAX_SECONDS, video_id)
+            return json_error("Access denied.", 403)
+        sessions.register(jti, ip_hash)  # slides expiry, re-binds IP and counts a change
+        if sess.ip_changes > MAX_SESSION_IP_CHANGES:
+            log.warning(
+                "[deny] playback URL used from too many networks (%d changes), session dropped. video_id=%s ip=%s",
+                sess.ip_changes, video_id, ip,
             )
-        sessions.register(jti, ip_hash)  # re-binds sess.ip to the current value too
+            fire_and_forget(report_suspicious("ip_mismatch", getattr(sess, "aid", ""), video_id, getattr(sess, "uid", ""), ip))
+            revoke(jti)
+            return json_error("Access denied.", 403)
         source_ref = sess.source_ref  # type: ignore[attr-defined]
         uid = sess.uid  # type: ignore[attr-defined]
 
@@ -379,6 +482,21 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
         log.warning("Telegram flood-wait %ss while resolving %s", e.seconds, source_ref)
         return json_error("Server is busy, try again shortly.", 503)
 
+    duration = getattr(getattr(msg, "file", None), "duration", None)
+    params = limiter.params(size, duration) if THROTTLE_DOWNLOADS else None
+    viewer = limiter.get((uid, video_id), params[1] if params else 0)
+    if viewer.conns >= limiter.max_conns:
+        log.warning("[deny] too many parallel connections (%d) for uid=%s video_id=%s", viewer.conns, uid, video_id)
+        return json_error("Too many requests.", 429)
+    if limiter.day_over(viewer, size):
+        log.warning("[deny] 24h data limit reached for uid=%s video_id=%s", uid, video_id)
+        return json_error("Too many requests.", 429)
+
+    async def pace(n: int) -> None:
+        wait = limiter.take(viewer, n, size, params)
+        if wait > 0:
+            await asyncio.sleep(wait)
+
     try:
         start, end = core.parse_range(request.headers.get("Range"), size) or (0, size - 1)
     except core.RangeNotSatisfiable:
@@ -391,6 +509,8 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
         "Accept-Ranges": "bytes",
         "Content-Length": str(length),
         "Cache-Control": "private, no-store",
+        "X-Content-Type-Options": "nosniff",
+        "Content-Disposition": "inline",
         **cors_headers(),
     }
     if is_partial:
@@ -400,16 +520,20 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
     await resp.prepare(request)
 
     sess.conns += 1
+    viewer.conns += 1
     try:
-        await stream_range(msg, start, end, resp, perf=(t0, t_resolved, video_id))
+        await stream_range(msg, start, end, resp, perf=(t0, t_resolved, video_id), pace=pace)
     except (ConnectionResetError, asyncio.CancelledError):
         pass  # viewer paused/seeked/closed the tab — not an error
+    except core.DailyLimitExceeded:
+        log.warning("[deny] 24h data limit reached mid-stream for uid=%s video_id=%s", uid, video_id)
     except errors.FileReferenceExpiredError:
         # File reference went stale mid-stream (long-running server,
         # rare) — drop the cache entry so the NEXT request re-resolves.
         _msg_cache.pop((parsed_ref.kind, parsed_ref.peer, parsed_ref.msg_id), None)
     finally:
         sess.conns = max(0, sess.conns - 1)
+        viewer.conns = max(0, viewer.conns - 1)
     return resp
 
 
@@ -452,7 +576,7 @@ async def fetch_chunk(msg, offset: int) -> bytes:
     return data
 
 
-async def stream_range(msg, start: int, end: int, resp: web.StreamResponse, perf: Optional[tuple] = None):
+async def stream_range(msg, start: int, end: int, resp: web.StreamResponse, perf: Optional[tuple] = None, pace=None):
     """Downloads [start, end] (inclusive) from Telegram and writes it to
     the HTTP response as it arrives. MTProto downloads happen in aligned
     chunks, so `start` is rounded down to a DOWNLOAD_CHUNK boundary and the
@@ -460,7 +584,8 @@ async def stream_range(msg, start: int, end: int, resp: web.StreamResponse, perf
 
     Up to PREFETCH_CHUNKS chunks are fetched concurrently and written in
     order (see the comment above). `perf` = (t0, t_resolved, video_id) is
-    only used to log how long the first byte took.
+    only used to log how long the first byte took. `pace(n)` (optional) is
+    awaited before each write; it enforces the per-viewer speed limit.
     """
     aligned_start = (start // DOWNLOAD_CHUNK) * DOWNLOAD_CHUNK
     skip = start - aligned_start
@@ -489,6 +614,8 @@ async def stream_range(msg, start: int, end: int, resp: web.StreamResponse, perf
             skip = 0
             n = min(len(piece), remaining)
             if n > 0:
+                if pace is not None:
+                    await pace(n)
                 await resp.write(piece if n == len(piece) else piece[:n])
                 remaining -= n
                 if not wrote_first:
@@ -519,6 +646,10 @@ async def periodic_purge():
         n = sessions.purge()
         if n:
             log.info("purged %d expired sessions", n)
+        limiter.purge()
+        now = time.time()
+        for k in [k for k, v in _revoked.items() if v < now]:
+            del _revoked[k]
 
 
 

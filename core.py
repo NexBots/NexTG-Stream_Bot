@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import ipaddress
 import json
 import re
 import time
@@ -143,26 +144,40 @@ def parse_range(header: Optional[str], size: int) -> Optional[tuple[int, int]]:
 # --------------------------------------------------------------------------
 
 
-def client_ip(xff: Optional[str], remote: Optional[str], trusted_hops: int = 1) -> str:
-    """The FIRST entry of X-Forwarded-For — the original client, with
-    every hop after it (Cloudflare, Render's own internal load balancer,
-    etc.) appending ITS OWN address afterwards rather than rewriting the
-    front. This deliberately mirrors ../lib/requestInfo.ts's
-    getClientIp() on the Next.js/Vercel side (forwardedFor.split(',')[0])
-    byte-for-byte, since a token minted there and checked here must
-    agree on what "the client's IP" even means, or every request looks
-    like an IP mismatch regardless of who's actually asking.
+def _valid_ip(v: Optional[str]) -> Optional[str]:
+    if not v:
+        return None
+    v = v.strip()
+    try:
+        ipaddress.ip_address(v)
+    except ValueError:
+        return None
+    return v
 
-    trusted_hops is accepted for backwards-compat signature stability
-    but no longer changes which entry is picked — see the fix history in
-    tg-stream/README.md if this ever needs to become more elaborate
-    (e.g. an untrusted hop somehow ending up in FRONT of the real
-    client's own entry, which no reverse proxy in this deployment does).
+
+def client_ip(xff: Optional[str], remote: Optional[str], trusted_hops: int = 1, preferred: Optional[str] = None) -> str:
+    """The client's IP as seen by this server.
+
+    `preferred` is a header value that the edge in front of us SETS
+    (overwriting anything the client sent): Cloudflare's CF-Connecting-IP
+    or True-Client-IP. It is the only value a client cannot forge, so it
+    wins whenever it is present and is a real IP address.
+
+    Otherwise fall back to X-Forwarded-For, taking the entry the nearest
+    trusted proxy appended: `trusted_hops` entries from the RIGHT. (The
+    LEFT-most entry is whatever the client chose to send, so using it
+    would let anyone pretend to be somebody else's IP.)
     """
-    if xff:
+    ip = _valid_ip(preferred)
+    if ip:
+        return ip
+    if xff and trusted_hops > 0:
         parts = [p.strip() for p in xff.split(",") if p.strip()]
         if parts:
-            return parts[0]
+            idx = max(0, len(parts) - trusted_hops)
+            ip = _valid_ip(parts[idx])
+            if ip:
+                return ip
     return remote or "unknown"
 
 
@@ -212,6 +227,8 @@ class SessionState:
     source_ref: str = ""
     uid: str = ""
     aid: str = ""
+    born: float = 0.0  # when the session was first registered (absolute cap, never slides)
+    ip_changes: int = 0  # how many times the client IP differed from the previous request
 
 
 @dataclass
@@ -223,12 +240,17 @@ class SessionStore:
         now = time.time() if now is None else now
         st = self._s.get(jti)
         if st is None:
-            st = SessionState(exp=now + self.ttl, ip=ip_hash)
+            st = SessionState(exp=now + self.ttl, ip=ip_hash, born=now)
             self._s[jti] = st
         else:
             st.exp = now + self.ttl
+            if st.ip != ip_hash:
+                st.ip_changes += 1
             st.ip = ip_hash
         return st
+
+    def drop(self, jti: str) -> None:
+        self._s.pop(jti, None)
 
     def get(self, jti: str) -> Optional[SessionState]:
         return self._s.get(jti)
@@ -242,3 +264,107 @@ class SessionStore:
 
     def __len__(self):
         return len(self._s)
+
+
+# --------------------------------------------------------------------------
+# Per-viewer (one user x one video) download limits.
+#
+# A real player reads a video at roughly its bitrate, with short bursts when
+# it fills its buffer or the viewer seeks. A "download manager" or a script
+# reads as fast as the connection allows, on many connections. These limits
+# keep normal playback untouched but make a bulk copy slow, so it takes
+# about as long as watching the class, and cap what one account can pull in
+# a day. They are keyed on (user, video) — NOT on the token — so asking for
+# a fresh token doesn't reset them.
+# --------------------------------------------------------------------------
+
+MB = 1024 * 1024
+
+
+@dataclass
+class ViewerState:
+    tokens: float  # bytes we may send right now (token bucket)
+    last: float  # last refill time
+    day_start: float
+    day_bytes: int = 0
+    conns: int = 0  # open media responses for this viewer+video
+    seen: float = 0.0  # last activity, for purging
+
+
+class DailyLimitExceeded(Exception):
+    pass
+
+
+class ViewerLimiter:
+    def __init__(
+        self,
+        max_conns: int = 4,
+        day_factor: float = 6.0,  # a viewer may pull at most this many x the file size per 24h
+        rate_factor: float = 3.0,  # sustained speed = this many x the video's own bitrate
+        burst_seconds: float = 120.0,  # bucket holds this many seconds of video (at rate_factor)
+        min_rate: float = 0.5 * MB,  # never throttle below this (bytes/s) — 4 Mbit/s
+        min_burst: float = 32 * MB,
+    ):
+        self.max_conns = max_conns
+        self.day_factor = day_factor
+        self.rate_factor = rate_factor
+        self.burst_seconds = burst_seconds
+        self.min_rate = min_rate
+        self.min_burst = min_burst
+        self._v: dict = {}
+
+    def params(self, size: int, duration: Optional[float]) -> Optional[tuple[float, float]]:
+        """(rate bytes/s, bucket capacity bytes), or None when we can't
+        compute a bitrate (unknown duration -> no throttling)."""
+        if not duration or duration <= 0 or size <= 0:
+            return None
+        rate = max(self.min_rate, (size / duration) * self.rate_factor)
+        capacity = max(self.min_burst, rate * self.burst_seconds)
+        return rate, capacity
+
+    def get(self, key, capacity: float, now: Optional[float] = None) -> ViewerState:
+        now = time.time() if now is None else now
+        st = self._v.get(key)
+        if st is None:
+            st = ViewerState(tokens=capacity, last=now, day_start=now)
+            self._v[key] = st
+        st.seen = now
+        return st
+
+    def day_over(self, st: ViewerState, size: int, now: Optional[float] = None) -> bool:
+        now = time.time() if now is None else now
+        if self.day_factor <= 0:
+            return False  # daily cap disabled
+        if now - st.day_start > 86400:
+            st.day_start, st.day_bytes = now, 0
+        return st.day_bytes >= self.day_factor * size
+
+    def take(self, st: ViewerState, n: int, size: int, params: Optional[tuple[float, float]], now: Optional[float] = None) -> float:
+        """Account for sending `n` bytes. Returns how many seconds the caller
+        must wait before sending (0 = send now). Raises DailyLimitExceeded
+        once the 24h budget is used up."""
+        now = time.time() if now is None else now
+        if self.day_over(st, size, now):
+            raise DailyLimitExceeded()
+        if params is None:
+            st.day_bytes += n
+            return 0.0
+        rate, capacity = params
+        st.tokens = min(capacity, st.tokens + (now - st.last) * rate)
+        st.last = now
+        if st.tokens >= n:
+            st.tokens -= n
+            st.day_bytes += n
+            return 0.0
+        wait = (n - st.tokens) / rate
+        st.tokens = 0.0  # we'll have exactly n worth by the time the wait is over
+        st.last = now + wait
+        st.day_bytes += n
+        return wait
+
+    def purge(self, now: Optional[float] = None, idle: float = 2 * 86400) -> int:
+        now = time.time() if now is None else now
+        dead = [k for k, v in self._v.items() if v.conns == 0 and now - v.seen > idle]
+        for k in dead:
+            del self._v[k]
+        return len(dead)

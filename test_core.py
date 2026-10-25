@@ -91,9 +91,18 @@ class TestRange(unittest.TestCase):
 
 class TestIp(unittest.TestCase):
     def test_cases(self):
-        self.assertEqual(core.client_ip("6.6.6.6, 1.2.3.4", "10.0.0.1", 1), "1.2.3.4")  # spoofed left entry ignored
+        # the proxy appended 1.2.3.4; the left entry is whatever the client claimed
+        self.assertEqual(core.client_ip("6.6.6.6, 1.2.3.4", "10.0.0.1", 1), "1.2.3.4")
+        self.assertEqual(core.client_ip("6.6.6.6, 7.7.7.7, 1.2.3.4", "10.0.0.1", 2), "7.7.7.7")
+        self.assertEqual(core.client_ip("1.2.3.4", "10.0.0.1", 1), "1.2.3.4")
         self.assertEqual(core.client_ip(None, "10.0.0.1", 1), "10.0.0.1")
-        self.assertEqual(core.client_ip("1.2.3.4", "10.0.0.1", 0), "10.0.0.1")
+        self.assertEqual(core.client_ip("1.2.3.4", "10.0.0.1", 0), "10.0.0.1")  # no trusted proxy -> ignore XFF
+        self.assertEqual(core.client_ip("not-an-ip", "10.0.0.1", 1), "10.0.0.1")
+
+    def test_edge_set_header_wins_and_is_validated(self):
+        self.assertEqual(core.client_ip("6.6.6.6, 9.9.9.9", "10.0.0.1", 1, preferred="1.2.3.4"), "1.2.3.4")
+        self.assertEqual(core.client_ip("6.6.6.6, 9.9.9.9", "10.0.0.1", 1, preferred="junk"), "9.9.9.9")
+        self.assertEqual(core.client_ip(None, "10.0.0.1", 1, preferred="2001:db8::1"), "2001:db8::1")
 
 
 class TestCache(unittest.TestCase):
@@ -114,6 +123,73 @@ class TestSessions(unittest.TestCase):
         self.assertEqual(s.purge(now=1100), 0)
         self.assertEqual(s.purge(now=2000), 1)
         self.assertEqual(len(s), 0)
+
+
+class TestSessionHardening(unittest.TestCase):
+    def test_ip_changes_counted_and_drop(self):
+        s = core.SessionStore(ttl=100)
+        st = s.register("j", "A", now=1000)
+        self.assertEqual((st.born, st.ip_changes), (1000, 0))
+        s.register("j", "A", now=1010)
+        self.assertEqual(st.ip_changes, 0)
+        s.register("j", "B", now=1020)
+        s.register("j", "A", now=1030)
+        self.assertEqual(st.ip_changes, 2)
+        self.assertEqual(st.born, 1000)  # absolute age never slides
+        s.drop("j")
+        self.assertIsNone(s.get("j"))
+
+
+class TestViewerLimiter(unittest.TestCase):
+    def setUp(self):
+        self.L = core.ViewerLimiter(max_conns=4, day_factor=6, rate_factor=3, burst_seconds=120, min_rate=0.5 * core.MB, min_burst=32 * core.MB)
+        self.size = 1100 * core.MB
+        self.dur = 95 * 60  # ~1.93 MB/s bitrate, like the real class video
+
+    def test_params(self):
+        rate, cap = self.L.params(self.size, self.dur)
+        self.assertAlmostEqual(rate / core.MB, 1100 / 5700 * 3, places=2)
+        self.assertGreaterEqual(cap, 32 * core.MB)
+        self.assertIsNone(self.L.params(self.size, None))
+        self.assertIsNone(self.L.params(self.size, 0))
+
+    def test_normal_playback_never_waits(self):
+        p = self.L.params(self.size, self.dur)
+        st = self.L.get(("u", "v"), p[1], now=0)
+        # real-time playback at ~bitrate, pulled in 1MB chunks, plus a seek burst of 40MB
+        t = 0.0
+        waited = 0.0
+        for _ in range(600):
+            t += 5.0  # 1MB every 5s = ~0.2MB/s, the video's real bitrate
+            waited += self.L.take(st, core.MB, self.size, p, now=t)
+        for _ in range(40):
+            waited += self.L.take(st, core.MB, self.size, p, now=t)
+        self.assertEqual(waited, 0.0)
+
+    def test_bulk_download_is_slowed_to_a_multiple_of_playtime(self):
+        p = self.L.params(self.size, self.dur)
+        st = self.L.get(("u", "v"), p[1], now=0)
+        t = 0.0
+        for _ in range(1100):  # a download manager grabbing the whole file as fast as it can
+            t += self.L.take(st, core.MB, self.size, p, now=t)
+        self.assertGreater(t, self.dur / 3 * 0.8)  # >= ~1/3 of the video's own duration
+        self.assertLess(t, self.dur / 3 * 1.2)
+
+    def test_daily_cap(self):
+        size = 100 * core.MB
+        p = self.L.params(size, 3600)
+        st = self.L.get(("u", "v"), p[1], now=0)
+        sent = 0
+        with self.assertRaises(core.DailyLimitExceeded):
+            while True:
+                self.L.take(st, core.MB, size, p, now=0)
+                sent += 1
+        self.assertEqual(sent, 600)  # 6 x 100MB
+        self.assertFalse(self.L.day_over(st, size, now=90000))  # window resets after 24h
+
+    def test_unknown_duration_not_throttled_but_capped(self):
+        st = self.L.get(("u", "v"), 0, now=0)
+        self.assertEqual(self.L.take(st, core.MB, 10 * core.MB, None, now=0), 0.0)
 
 
 if __name__ == "__main__":
