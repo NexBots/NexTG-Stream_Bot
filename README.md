@@ -107,6 +107,11 @@ RATE_LIMIT_PER_MIN=240
    `https://t.me/mychannel/123`.
 2. In `/admin/videos`, pick **Telegram channel**, paste that link, save.
 
+**Groups with Topics (forum groups):** the link looks like
+`https://t.me/c/4408902778/2/3` (group / topic / message). The server accepts
+`c/<group>/<topic>/<message>` — the last number is the message id, the middle
+one is the topic id. The Telegram account must be a member of the group.
+
 That's it — no need to hand-construct `source_ref`; the admin form
 parses either link shape itself (`app/admin/videos/page.tsx`'s
 `parseTelegramRef`).

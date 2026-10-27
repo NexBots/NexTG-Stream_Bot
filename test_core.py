@@ -70,8 +70,14 @@ class TestSourceRef(unittest.TestCase):
         self.assertEqual(core.parse_source_ref("c/1234567890/45"), core.SourceRef("private", 1234567890, 45))
         self.assertEqual(core.parse_source_ref("my_channel/9"), core.SourceRef("public", "my_channel", 9))
 
+    def test_forum_topic_links(self):
+        # https://t.me/c/4408902778/2/3 -> group 4408902778, topic 2, message 3
+        self.assertEqual(core.parse_source_ref("c/4408902778/2/3"), core.SourceRef("private", 4408902778, 3, 2))
+        self.assertEqual(core.parse_source_ref("c/4408902778/2/3").msg_id, 3)
+        self.assertEqual(core.parse_source_ref("my_group/5/77"), core.SourceRef("public", "my_group", 77, 5))
+
     def test_bad(self):
-        for bad in ["", "c/12/3", "c/abc/1", "a/1", "x y/1", "chan/-1", "chan/1/2", "../etc/1", "http://t.me/a/1"]:
+        for bad in ["", "c/12/3", "c/abc/1", "a/1", "x y/1", "chan/-1", "chan/1/2/3/4", "c/1234567890/1/2/3", "../etc/1", "http://t.me/a/1"]:
             self.assertIsNone(core.parse_source_ref(bad), bad)
 
 

@@ -75,27 +75,35 @@ def hash_for_token(value: str) -> str:
 
 
 # --------------------------------------------------------------------------
-# source_ref  ("c/<channelId>/<msgId>"  or  "<username>/<msgId>")
+# source_ref  ("c/<chatId>/<msgId>"  or  "c/<chatId>/<topicId>/<msgId>"
+#              or "<username>/<msgId>" or "<username>/<topicId>/<msgId>")
+#
+# The 3-part form is what Telegram gives you for a message inside a forum
+# group's topic (Topics enabled). The middle number is the topic id; the
+# LAST number is always the real message id.
 # --------------------------------------------------------------------------
 
-_PRIVATE_RE = re.compile(r"^c/(\d{4,15})/(\d{1,10})$")
-_PUBLIC_RE = re.compile(r"^([A-Za-z][A-Za-z0-9_]{3,31})/(\d{1,10})$")
+_PRIVATE_RE = re.compile(r"^c/(\d{4,15})(?:/(\d{1,10}))?/(\d{1,10})$")
+_PUBLIC_RE = re.compile(r"^([A-Za-z][A-Za-z0-9_]{3,31})(?:/(\d{1,10}))?/(\d{1,10})$")
 
 
 @dataclass(frozen=True)
 class SourceRef:
     kind: str  # 'private' | 'public'
-    peer: object  # int channel id (private) or str username (public)
+    peer: object  # int chat id (private) or str username (public)
     msg_id: int
+    topic_id: Optional[int] = None  # forum topic id, informational only
 
 
 def parse_source_ref(sr: str) -> Optional[SourceRef]:
     m = _PRIVATE_RE.match(sr or "")
     if m:
-        return SourceRef("private", int(m.group(1)), int(m.group(2)))
+        topic = int(m.group(2)) if m.group(2) else None
+        return SourceRef("private", int(m.group(1)), int(m.group(3)), topic)
     m = _PUBLIC_RE.match(sr or "")
     if m:
-        return SourceRef("public", m.group(1), int(m.group(2)))
+        topic = int(m.group(2)) if m.group(2) else None
+        return SourceRef("public", m.group(1), int(m.group(3)), topic)
     return None
 
 
