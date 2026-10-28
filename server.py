@@ -275,6 +275,22 @@ async def _nearby_summary(entity, msg_id: int) -> str:
         return f"(could not inspect nearby messages: {type(e).__name__})"
 
 
+async def get_chat_entity(sr: core.SourceRef):
+    """Resolve the chat for a SourceRef. Private chats/groups (incl. forum
+    groups with Topics) are looked up by numeric id, which Telethon can only
+    do if the entity is in its cache. A fresh StringSession has an empty
+    cache after every restart, so on a miss we load the account's dialogs once
+    (this fills the cache) and retry."""
+    if sr.kind != "private":
+        return await client.get_entity(sr.peer)
+    peer_id = int(f"-100{sr.peer}")
+    try:
+        return await client.get_entity(peer_id)
+    except ValueError:
+        await client.get_dialogs()
+        return await client.get_entity(peer_id)
+
+
 async def resolve_message(sr: core.SourceRef):
     key = (sr.kind, sr.peer, sr.msg_id)
     cached = _msg_cache.get(key)
@@ -282,13 +298,11 @@ async def resolve_message(sr: core.SourceRef):
         return cached[0]
 
     try:
-        if sr.kind == "private":
-            # Numeric internal channel id -> Telethon peer. The account this
-            # client is logged in as MUST already be a member of the channel
-            # (see README.md) or get_entity will fail.
-            entity = await client.get_entity(int(f"-100{sr.peer}"))
-        else:
-            entity = await client.get_entity(sr.peer)
+        # The account this client is logged in as MUST already be a member of
+        # the channel / group (see README.md) or this will fail. Forum topic
+        # links (c/<group>/<topic>/<msg>) resolve the same way: the message id
+        # is global within the group, the topic id isn't needed to fetch it.
+        entity = await get_chat_entity(sr)
     except errors.FloodWaitError:
         raise
     except (ValueError, errors.RPCError) as e:
@@ -696,7 +710,7 @@ async def handle_scan(request: web.Request) -> web.Response:
         return web.json_response({"error": "to must be >= from"}, status=400)
 
     try:
-        entity = await client.get_entity(int(f"-100{sr.peer}") if sr.kind == "private" else sr.peer)
+        entity = await get_chat_entity(sr)
     except (ValueError, errors.RPCError) as e:
         return web.json_response({"error": f"bot can't open this chat: {type(e).__name__}: {e}"}, status=403)
 
