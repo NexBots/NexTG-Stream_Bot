@@ -189,6 +189,22 @@ def client_ip(xff: Optional[str], remote: Optional[str], trusted_hops: int = 1, 
     return remote or "unknown"
 
 
+def network_key(ip: str) -> str:
+    """Coarse "which network is this" label: the /24 of an IPv4 address or the /48 of an IPv6 one.
+
+    Mobile carriers hand a phone a different address from the same pool every few minutes, and Wi-Fi
+    renewals do the same. Comparing whole addresses made those look like "the playback URL moved to
+    another network" and the session was killed in the middle of a class. Comparing the network
+    (not the exact address) only reacts when the URL really appears somewhere else.
+    """
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return ip or "unknown"
+    prefix = 24 if addr.version == 4 else 48
+    return str(ipaddress.ip_network(f"{addr}/{prefix}", strict=False))
+
+
 # --------------------------------------------------------------------------
 # Byte-bounded LRU for downloaded Telegram chunks
 # --------------------------------------------------------------------------
@@ -236,7 +252,13 @@ class SessionState:
     uid: str = ""
     aid: str = ""
     born: float = 0.0  # when the session was first registered (absolute cap, never slides)
-    ip_changes: int = 0  # how many times the client IP differed from the previous request
+    ip_changes: int = 0  # recent times the client network differed from the previous request (forgotten after IP_CHANGE_FORGET_SECONDS)
+    last_ip_change: float = 0.0
+
+
+# A network change older than this no longer counts: a student who moves from Wi-Fi to mobile data
+# once an hour is normal; two people flipping one URL back and forth change it every few seconds.
+IP_CHANGE_FORGET_SECONDS = 600
 
 
 @dataclass
@@ -253,7 +275,10 @@ class SessionStore:
         else:
             st.exp = now + self.ttl
             if st.ip != ip_hash:
+                if st.ip_changes and now - st.last_ip_change > IP_CHANGE_FORGET_SECONDS:
+                    st.ip_changes = 0
                 st.ip_changes += 1
+                st.last_ip_change = now
             st.ip = ip_hash
         return st
 
@@ -297,6 +322,7 @@ class ViewerState:
     day_bytes: int = 0
     conns: int = 0  # open media responses for this viewer+video
     seen: float = 0.0  # last activity, for purging
+    tasks: list = field(default_factory=list)  # request tasks of the open responses, oldest first
 
 
 class DailyLimitExceeded(Exception):

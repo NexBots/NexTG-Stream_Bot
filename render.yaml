@@ -10,6 +10,9 @@ services:
     dockerfilePath: ./Dockerfile
     dockerContext: .
     plan: free
+    # Closest Render region to your viewers (Bangladesh -> Singapore). Changing the region of an existing
+    # service means creating it again in the dashboard; the blueprint only applies to new services.
+    region: singapore
     healthCheckPath: /healthz
     envVars:
       - key: LISTEN_HOST
@@ -19,7 +22,7 @@ services:
       - key: SESSION_TTL_SECONDS
         value: "28800"
       - key: CHUNK_CACHE_MAX_MB
-        value: "256"
+        value: "96"
       - key: RATE_LIMIT_PER_MIN
         value: "240"
       - key: TELEGRAM_API_ID

@@ -7,6 +7,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 # cryptg makes Telegram's AES several times faster. Optional: if no prebuilt
 # wheel exists for this platform, the build must still succeed without it.
 RUN pip install --no-cache-dir cryptg || echo "cryptg not installed, continuing without it"
+# uvloop: a much faster asyncio event loop. Optional, server.py falls back to the standard one.
+RUN pip install --no-cache-dir uvloop || echo "uvloop not installed, continuing without it"
+# Print (in the build log) whether the fast AES made it in. If this says MISSING, Telegram downloads decrypt
+# in pure Python at a few hundred KB/s and videos will stutter whatever else you tune.
+RUN python3 -c "import cryptg; print('BUILD CHECK: cryptg OK (fast AES)')" || echo "BUILD CHECK: cryptg MISSING - downloads will be very slow"
+ENV PYTHONUNBUFFERED=1
 
 COPY core.py server.py ./
 

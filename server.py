@@ -78,7 +78,9 @@ SELF_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 REPORT_IP_MISMATCH = os.environ.get("REPORT_IP_MISMATCH", "1") != "0"
 
 SESSION_TTL_SECONDS = int(os.environ.get("SESSION_TTL_SECONDS", str(8 * 3600)))  # comfortably over the longest class
-CHUNK_CACHE_BYTES = int(os.environ.get("CHUNK_CACHE_MAX_MB", "256")) * 1024 * 1024
+# 96 MB, not 256: the free Render instance has 512 MB in total, and running out of memory restarts the
+# whole service (every viewer's video drops at once).
+CHUNK_CACHE_BYTES = int(os.environ.get("CHUNK_CACHE_MAX_MB", "96")) * 1024 * 1024
 DOWNLOAD_CHUNK = 1024 * 1024  # Telegram MTProto part size for iter_download; must stay a power of 2, 4KiB-aligned
 RATE_LIMIT_PER_MIN = int(os.environ.get("RATE_LIMIT_PER_MIN", "240"))  # per uid, generous (many Range requests/scrub)
 
@@ -103,15 +105,15 @@ REQUIRE_REFERER = os.environ.get("REQUIRE_REFERER", "1") != "0"
 ALLOWED_ORIGINS = [o.strip().rstrip("/") for o in ([APP_ORIGIN] + os.environ.get("EXTRA_ALLOWED_ORIGINS", "").split(",")) if o.strip()]
 # A stolen/copied URL stops working once it's used from more than this many
 # different networks (a student switching Wi-Fi <-> mobile data uses 1-2).
-MAX_SESSION_IP_CHANGES = int(os.environ.get("MAX_SESSION_IP_CHANGES", "4"))
+MAX_SESSION_IP_CHANGES = int(os.environ.get("MAX_SESSION_IP_CHANGES", "6"))
 # Hard cap on one playback session's age; the player silently gets a new token.
 SESSION_MAX_SECONDS = int(os.environ.get("SESSION_MAX_SECONDS", str(6 * 3600)))
 # Limits per (user, video), see core.ViewerLimiter.
 THROTTLE_DOWNLOADS = os.environ.get("THROTTLE_DOWNLOADS", "1") != "0"
 limiter = core.ViewerLimiter(
-    max_conns=int(os.environ.get("MAX_CONNS_PER_VIEWER", "4")),
+    max_conns=int(os.environ.get("MAX_CONNS_PER_VIEWER", "8")),
     day_factor=float(os.environ.get("DAILY_BYTES_FACTOR", "6")),  # 0 = no daily cap
-    rate_factor=float(os.environ.get("STREAM_RATE_FACTOR", "3")),
+    rate_factor=float(os.environ.get("STREAM_RATE_FACTOR", "5")),  # 5x: leaves room for 2x playback speed + a slow Telegram moment
 )
 # Header the edge sets with the real client IP (Cloudflare: CF-Connecting-IP).
 # Empty = try CF-Connecting-IP, then True-Client-IP, then X-Forwarded-For.
@@ -177,7 +179,20 @@ class _RedactTokens(logging.Filter):
 
 logging.getLogger("aiohttp.access").addFilter(_RedactTokens())
 
-client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+client = TelegramClient(
+    StringSession(SESSION_STRING),
+    API_ID,
+    API_HASH,
+    # We only read files. Without this Telethon also processes every update (new message, edit, ...) of every
+    # chat the account is in, which costs CPU on a small instance for nothing.
+    receive_updates=False,
+    # Wait out a short Telegram "slow down" automatically (<= 5 s) but fail fast on a long one, instead of
+    # silently freezing a viewer's video for up to a minute (Telethon's default threshold is 60 s).
+    flood_sleep_threshold=5,
+    connection_retries=10,
+    retry_delay=1,
+    request_retries=5,
+)
 
 # entity/message cache — avoids a get_messages round trip on every one of
 # the dozens of Range requests one video generates. File references
@@ -378,6 +393,9 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
     token = request.query.get("t")
     ip = request_ip(request)
     ip_hash = core.hash_for_token(ip)
+    # sessions compare the NETWORK (/24), not the exact address, so a phone whose address changes inside its
+    # carrier pool does not look like a stolen URL.
+    net_hash = core.hash_for_token(core.network_key(ip))
 
     if not token:
         log.warning("[deny] no token, video_id=%s ip=%s", video_id, ip)
@@ -440,7 +458,7 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
         source_ref = payload.get("sr", "")
         uid = payload.get("uid", "")
         aid = payload.get("aid", "")
-        sess = sessions.register(jti, ip_hash)
+        sess = sessions.register(jti, net_hash)
         sess.source_ref = source_ref  # type: ignore[attr-defined]
         sess.uid = uid  # type: ignore[attr-defined]
         sess.aid = aid  # type: ignore[attr-defined]
@@ -455,7 +473,7 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
             revoke(jti)
             log.info("[info] session older than %ss, dropped (player will get a new token). video_id=%s", SESSION_MAX_SECONDS, video_id)
             return json_error("Access denied.", 403)
-        sessions.register(jti, ip_hash)  # slides expiry, re-binds IP and counts a change
+        sessions.register(jti, net_hash)  # slides expiry, re-binds the network and counts a change
         if sess.ip_changes > MAX_SESSION_IP_CHANGES:
             log.warning(
                 "[deny] playback URL used from too many networks (%d changes), session dropped. video_id=%s ip=%s",
@@ -500,16 +518,31 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
     params = limiter.params(size, duration) if THROTTLE_DOWNLOADS else None
     viewer = limiter.get((uid, video_id), params[1] if params else 0)
     if viewer.conns >= limiter.max_conns:
-        log.warning("[deny] too many parallel connections (%d) for uid=%s video_id=%s", viewer.conns, uid, video_id)
-        return json_error("Too many requests.", 429)
+        # A browser that seeks leaves the previous request behind (we only notice once we next write to it).
+        # The NEWEST request is the one the viewer is waiting for, so end the oldest instead of answering 429,
+        # which used to stop the video.
+        oldest = viewer.tasks.pop(0) if viewer.tasks else None
+        if oldest is None or oldest.done():
+            log.warning("[deny] too many parallel connections (%d) for uid=%s video_id=%s", viewer.conns, uid, video_id)
+            return json_error("Too many requests.", 429)
+        log.info("[info] connection limit reached for uid=%s video_id=%s: ending the oldest request", uid, video_id)
+        oldest.cancel()
     if limiter.day_over(viewer, size):
         log.warning("[deny] 24h data limit reached for uid=%s video_id=%s", uid, video_id)
         return json_error("Too many requests.", 429)
 
+    def alive() -> bool:
+        t = request.transport
+        return t is not None and not t.is_closing()
+
     async def pace(n: int) -> None:
         wait = limiter.take(viewer, n, size, params)
-        if wait > 0:
-            await asyncio.sleep(wait)
+        while wait > 0:
+            step = min(wait, 1.0)
+            await asyncio.sleep(step)
+            wait -= step
+            if not alive():
+                raise ConnectionResetError()
 
     try:
         start, end = core.parse_range(request.headers.get("Range"), size) or (0, size - 1)
@@ -535,8 +568,11 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
 
     sess.conns += 1
     viewer.conns += 1
+    me = asyncio.current_task()
+    if me is not None:
+        viewer.tasks.append(me)
     try:
-        await stream_range(msg, start, end, resp, perf=(t0, t_resolved, video_id), pace=pace)
+        await stream_range(msg, start, end, resp, perf=(t0, t_resolved, video_id), pace=pace, alive=alive)
     except (ConnectionResetError, asyncio.CancelledError):
         pass  # viewer paused/seeked/closed the tab — not an error
     except core.DailyLimitExceeded:
@@ -548,6 +584,8 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
     finally:
         sess.conns = max(0, sess.conns - 1)
         viewer.conns = max(0, viewer.conns - 1)
+        if me is not None and me in viewer.tasks:
+            viewer.tasks.remove(me)
     return resp
 
 
@@ -564,14 +602,35 @@ PREFETCH_CHUNKS = int(os.environ.get("PREFETCH_CHUNKS", "4"))
 STARTUP_CHUNKS = int(os.environ.get("STARTUP_CHUNKS", "2"))
 
 
-async def fetch_chunk(msg, offset: int) -> bytes:
-    """One DOWNLOAD_CHUNK-sized part of the file starting at `offset`
-    (must be DOWNLOAD_CHUNK-aligned). Served from the chunk cache when
-    possible; b'' means the offset is past the end of the file."""
-    key = (msg.chat_id, msg.id, offset)
-    cached = chunk_cache.get(key)
-    if cached is not None:
-        return cached
+# How many Telegram part-downloads may run at once across ALL viewers. Everything shares one MTProto
+# connection; with 30 viewers x 4 read-ahead chunks the queue on that connection got long enough that a
+# viewer who had just pressed play or seeked waited behind everybody else's read-ahead. Two lanes fix that:
+# the first chunks of a request ("urgent") have their own slots and never queue behind read-ahead.
+TG_CONCURRENCY = int(os.environ.get("TG_CONCURRENCY", "10"))
+TG_URGENT_CONCURRENCY = int(os.environ.get("TG_URGENT_CONCURRENCY", "6"))
+CHUNK_RETRIES = int(os.environ.get("CHUNK_RETRIES", "3"))
+CHUNK_TIMEOUT = float(os.environ.get("CHUNK_TIMEOUT", "20"))
+SLOW_CHUNK_LOG_SECONDS = 3.0
+
+_bulk_sem = asyncio.Semaphore(TG_CONCURRENCY)
+_urgent_sem = asyncio.Semaphore(TG_URGENT_CONCURRENCY)
+# chunks being downloaded right now: a second viewer asking for the same chunk (a whole class often watches
+# the same lecture) joins the running download instead of starting its own.
+_inflight: dict = {}
+
+
+async def refresh_message(msg):
+    """Telegram file references expire after a few hours. Re-read the message to get a fresh one."""
+    new = await client.get_messages(msg.chat_id, ids=msg.id)
+    if new is None or not new.document:
+        raise SourceUnavailable("the message holding this video no longer exists", 404)
+    for k, (m, _) in list(_msg_cache.items()):
+        if m.id == msg.id and m.chat_id == msg.chat_id:
+            _msg_cache[k] = (new, time.time())
+    return new
+
+
+async def _download_part(msg, offset: int) -> bytes:
     it = client.iter_download(msg.media, offset=offset, request_size=DOWNLOAD_CHUNK, limit=1)
     data = b""
     try:
@@ -585,12 +644,84 @@ async def fetch_chunk(msg, offset: int) -> bytes:
                 await closer()
             except Exception:
                 pass
-    if data:
-        chunk_cache.put(key, data)
     return data
 
 
-async def stream_range(msg, start: int, end: int, resp: web.StreamResponse, perf: Optional[tuple] = None, pace=None):
+async def _fill_chunk(key: tuple, msg, offset: int, urgent: bool) -> bytes:
+    sem = _urgent_sem if urgent else _bulk_sem
+    t0 = time.monotonic()
+    last_error: Optional[BaseException] = None
+    for attempt in range(max(1, CHUNK_RETRIES)):
+        try:
+            async with sem:
+                data = await asyncio.wait_for(_download_part(msg, offset), CHUNK_TIMEOUT)
+            if data:
+                chunk_cache.put(key, data)
+            took = time.monotonic() - t0
+            if took > SLOW_CHUNK_LOG_SECONDS:
+                log.warning("[slow] chunk at offset=%d took %.1fs (attempt %d, urgent=%s, in flight=%d)", offset, took, attempt + 1, urgent, len(_inflight))
+            return data
+        except errors.FileReferenceExpiredError as e:
+            last_error = e
+            msg = await refresh_message(msg)
+        except errors.FloodWaitError as e:
+            if e.seconds > 8 or attempt == CHUNK_RETRIES - 1:
+                raise
+            await asyncio.sleep(e.seconds + 0.2)
+            last_error = e
+        except errors.RPCError as e:
+            # 5xx = Telegram-side hiccup, worth another try; anything else (auth, not found...) is final
+            if getattr(e, "code", 0) < 500 or attempt == CHUNK_RETRIES - 1:
+                raise
+            last_error = e
+            await asyncio.sleep(0.4 * (attempt + 1))
+        except (asyncio.TimeoutError, ConnectionError, OSError) as e:
+            last_error = e
+            if attempt == CHUNK_RETRIES - 1:
+                raise
+            log.warning("[retry] chunk at offset=%d failed (%s), trying again", offset, type(e).__name__)
+            await asyncio.sleep(0.4 * (attempt + 1))
+    raise last_error if last_error else LookupError("chunk download failed")
+
+
+def _inflight_done(key: tuple):
+    def cb(task: "asyncio.Task") -> None:
+        _inflight.pop(key, None)
+        if not task.cancelled():
+            task.exception()  # mark retrieved: a failure is reported to whoever awaited it, not logged twice
+
+    return cb
+
+
+async def fetch_chunk(msg, offset: int, urgent: bool = False) -> bytes:
+    """One DOWNLOAD_CHUNK-sized part of the file starting at `offset`
+    (must be DOWNLOAD_CHUNK-aligned). Served from the chunk cache when
+    possible, shared with any identical download already running, retried
+    on transient errors; b'' means the offset is past the end of the file."""
+    key = (msg.chat_id, msg.id, offset)
+    cached = chunk_cache.get(key)
+    if cached is not None:
+        return cached
+    task = _inflight.get(key)
+    if task is None:
+        task = asyncio.create_task(_fill_chunk(key, msg, offset, urgent))
+        _inflight[key] = task
+        task.add_done_callback(_inflight_done(key))
+    # shield: if THIS viewer goes away the shared download keeps running for the others
+    return await asyncio.shield(task)
+
+
+async def _wait_chunk(task: "asyncio.Task", alive) -> bytes:
+    """Waits for a chunk, but notices a viewer who left meanwhile (aiohttp does not cancel the handler for us)."""
+    while True:
+        done, _ = await asyncio.wait({task}, timeout=1.0)
+        if done:
+            return task.result()
+        if alive is not None and not alive():
+            raise ConnectionResetError()
+
+
+async def stream_range(msg, start: int, end: int, resp: web.StreamResponse, perf: Optional[tuple] = None, pace=None, alive=None):
     """Downloads [start, end] (inclusive) from Telegram and writes it to
     the HTTP response as it arrives. MTProto downloads happen in aligned
     chunks, so `start` is rounded down to a DOWNLOAD_CHUNK boundary and the
@@ -600,6 +731,7 @@ async def stream_range(msg, start: int, end: int, resp: web.StreamResponse, perf
     order (see the comment above). `perf` = (t0, t_resolved, video_id) is
     only used to log how long the first byte took. `pace(n)` (optional) is
     awaited before each write; it enforces the per-viewer speed limit.
+    `alive()` (optional) says whether the viewer is still connected.
     """
     aligned_start = (start // DOWNLOAD_CHUNK) * DOWNLOAD_CHUNK
     skip = start - aligned_start
@@ -616,12 +748,15 @@ async def stream_range(msg, start: int, end: int, resp: web.StreamResponse, perf
             off = next(offsets, None)
             if off is None:
                 return
-            pending.append(asyncio.create_task(fetch_chunk(msg, off)))
+            # until the first bytes are out, these are the "urgent" lane
+            pending.append(asyncio.create_task(fetch_chunk(msg, off, urgent=not wrote_first)))
 
     try:
         schedule()
         while pending and remaining > 0:
-            data = await pending.popleft()
+            if alive is not None and not alive():
+                break
+            data = await _wait_chunk(pending.popleft(), alive)
             if not data:
                 break
             piece = data[skip:] if skip else data
@@ -650,8 +785,36 @@ async def stream_range(msg, start: int, end: int, resp: web.StreamResponse, perf
             await asyncio.gather(*tasks, return_exceptions=True)
 
 
+def _rss_mb() -> Optional[float]:
+    try:
+        with open("/proc/self/statm") as f:
+            return round(int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1048576, 1)
+    except Exception:
+        return None
+
+
+def _has_cryptg() -> bool:
+    try:
+        import cryptg  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
 async def handle_health(request: web.Request) -> web.Response:
-    return web.json_response({"ok": True, "connected": client.is_connected(), "sessions": len(sessions)})
+    return web.json_response(
+        {
+            "ok": True,
+            "connected": client.is_connected(),
+            "sessions": len(sessions),
+            # the two numbers to look at when playback is slow:
+            "cryptg": _has_cryptg(),  # False = Telegram downloads decrypt in pure Python (very slow)
+            "rss_mb": _rss_mb(),  # near the instance's RAM limit = it is about to be restarted
+            "cache_mb": round(chunk_cache.size / 1048576, 1),
+            "downloads_in_flight": len(_inflight),
+        }
+    )
 
 
 async def periodic_purge():
@@ -793,4 +956,11 @@ def build_app() -> web.Application:
 
 
 if __name__ == "__main__":
+    try:
+        import uvloop
+
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+        log.info("uvloop is active (faster event loop)")
+    except Exception:
+        log.info("uvloop not installed, using the standard event loop")
     web.run_app(build_app(), host=LISTEN_HOST, port=LISTEN_PORT)

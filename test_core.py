@@ -146,6 +146,28 @@ class TestSessionHardening(unittest.TestCase):
         self.assertIsNone(s.get("j"))
 
 
+class TestNetworkKey(unittest.TestCase):
+    def test_same_network_same_key(self):
+        self.assertEqual(core.network_key("103.12.40.7"), core.network_key("103.12.40.200"))
+        self.assertNotEqual(core.network_key("103.12.40.7"), core.network_key("103.12.41.7"))
+
+    def test_ipv6_and_garbage(self):
+        self.assertEqual(core.network_key("2001:db8:aa:1::1"), core.network_key("2001:db8:aa:ffff::9"))
+        self.assertEqual(core.network_key("nonsense"), "nonsense")
+
+
+class TestIpChangeForgetting(unittest.TestCase):
+    def test_old_changes_are_forgotten(self):
+        s = core.SessionStore(ttl=100000)
+        st = s.register("j", "A", now=1000)
+        s.register("j", "B", now=1010)
+        s.register("j", "A", now=1020)
+        self.assertEqual(st.ip_changes, 2)
+        # much later a single change: the earlier flips no longer count
+        s.register("j", "C", now=1020 + core.IP_CHANGE_FORGET_SECONDS + 5)
+        self.assertEqual(st.ip_changes, 1)
+
+
 class TestViewerLimiter(unittest.TestCase):
     def setUp(self):
         self.L = core.ViewerLimiter(max_conns=4, day_factor=6, rate_factor=3, burst_seconds=120, min_rate=0.5 * core.MB, min_burst=32 * core.MB)

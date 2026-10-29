@@ -202,3 +202,31 @@ What a student's browser can see (the playback URL) can always be copied, so the
 After deploying, test playback on desktop Chrome, Android Chrome and iPhone Safari. If a browser can't play, set `REQUIRE_FETCH_DEST=0` and tell me which one.
 
 Also in Telegram: for the source channel turn on **Restrict saving content** (channel settings), keep it private, and don't add students to it.
+
+
+## Smooth playback / fewer drops (v2)
+
+What was changed and why (all values can be tuned with env vars on Render):
+
+| Problem seen | Cause | Fix |
+|---|---|---|
+| Video freezes, then the player reloads / "drops" | A single failed or slow Telegram request ended the whole response | Every chunk is **retried** (3x, `CHUNK_RETRIES`), a 20 s `CHUNK_TIMEOUT` per attempt, short flood-waits (<= 8 s) are waited out, expired file references are refreshed on the fly |
+| Drops after a few minutes, often on mobile data | The session was killed when the viewer's **exact IP** changed more than 4 times. Mobile/Wi-Fi addresses change inside the same network all the time | Sessions compare the **network (/24)**, forget changes older than 10 min, and the limit is now 6 (`MAX_SESSION_IP_CHANGES`) |
+| Video stops after seeking around | Each seek left an old request open; after 4 the next one got **429** | The **oldest** request is ended instead of refusing the newest. A viewer who left is noticed within 1 s |
+| Slow start / seek when many students watch | Everybody's read-ahead queued on one Telegram connection in front of the first chunk of the newest request | Two lanes: the first chunks of a request are **urgent** (`TG_URGENT_CONCURRENCY`, 6) and never wait behind read-ahead (`TG_CONCURRENCY`, 10) |
+| Same lecture watched by many students is slow | Each student downloaded the same chunk separately | **Single-flight**: identical chunk downloads are shared |
+| Service restarts, everyone drops at once | 256 MB chunk cache on a 512 MB instance | Cache default **96 MB**, memory shown in `/healthz` |
+| Video can't buffer ahead faster than 3x | Anti-download speed limit was tight | `STREAM_RATE_FACTOR` default 5 |
+| High CPU on the small instance | Telethon processed every Telegram update | `receive_updates=False`, plus **uvloop** |
+
+### Check it is healthy
+
+Open `https://<your-bot>.onrender.com/healthz`:
+
+* `"cryptg": true` is **required**. `false` means Telegram downloads are decrypted in pure Python (a few hundred KB/s): fix this first (the Docker build log prints `BUILD CHECK: cryptg OK / MISSING`).
+* `rss_mb` close to the plan's RAM (512 on the free plan) means it is about to be restarted: lower `CHUNK_CACHE_MAX_MB` or upgrade.
+* Log lines starting with `[slow]` show Telegram chunks that took more than 3 s; `[retry]` shows a failed attempt that was retried.
+
+### The hardware reality
+
+The free Render plan has a fraction of a CPU, 512 MB RAM and **sleeps**. If students are still waiting after the settings above, the single biggest upgrade is the paid *Starter* plan (always on, more CPU). Telegram itself is also not a video CDN: for the best result keep the videos as MP4 with the index at the front (`ffmpeg -i in.mp4 -c copy -movflags +faststart out.mp4`).
